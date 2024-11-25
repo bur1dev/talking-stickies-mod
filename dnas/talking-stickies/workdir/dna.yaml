@@ -5,6 +5,7 @@ name: talking-stickies
 integrity:
   network_seed: ~
   properties:
+    clone_limit: 100
     type: "TalkingStickies"
   origin_time: 2023-11-03T00:00:00.0Z
   zomes:
