@@ -18,6 +18,7 @@ import { writable, type Writable } from "svelte/store";
 import type { ProfilesStore } from '@holochain-open-dev/profiles';
 import type { WeaveClient } from '@theweave/api';
 import { getMyDna } from './util';
+import { CartStore } from "./CartStore";
 
 TimeAgo.addDefaultLocale(en)
 
@@ -49,6 +50,7 @@ export class TalkingStickiesStore {
   timeAgo = new TimeAgo("en-US");
   service: TalkingStickiesService;
   boardList: BoardList;
+  cartStore: CartStore; // Add this
   updating = false;
   synStore: SynStore;
   client: AppClient;
@@ -74,6 +76,40 @@ export class TalkingStickiesStore {
       const state = board.state();
       if (state) {
         bgUrl = state.props.bgUrl;
+      }
+
+      const cloneInfos = await this.service.callZome("get_cart_clones", null);
+      console.log("get_cart_clones result:", cloneInfos);
+
+      if (cloneInfos && cloneInfos.length > 0) {
+        const cartCells = {};
+        for (const info of cloneInfos) {
+          console.log("Clone info details:", {
+            dna_hash: encodeHashToBase64(info.dna_hash),
+            cart_dna_hash: encodeHashToBase64(info.cart_dna_hash),
+            agent_key: encodeHashToBase64(info.agent_key),
+          });
+          const cartId = `cart_${encodeHashToBase64(info.cart_dna_hash)}_${
+            info.created_at
+          }`;
+          console.log("Processing clone info:", {
+            info,
+            cartId,
+            cell_id: [info.cart_dna_hash, info.agent_key],
+          });
+          cartCells[cartId] = {
+            cell_id: [info.cart_dna_hash, info.agent_key] as [
+              Uint8Array,
+              Uint8Array
+            ],
+            network_seed: "",
+          };
+        }
+        this.cartStore.state.update((state) => ({
+          ...state,
+          cartCells,
+        }));
+        await this.cartStore.loadCarts();
       }
     }
     this.setUIprops({ showMenu: false, bgUrl });
@@ -121,5 +157,6 @@ export class TalkingStickiesStore {
       new SynClient(this.client, this.roleName, this.zomeName)
     );
     this.boardList = new BoardList(profilesStore, this.synStore);
+    this.cartStore = new CartStore(this.synStore, this.myAgentPubKeyB64);
   }
 }

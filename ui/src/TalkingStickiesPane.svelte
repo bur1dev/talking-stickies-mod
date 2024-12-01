@@ -29,10 +29,11 @@
   import { type AnyDhtHash, encodeHashToBase64 } from "@holochain/client";
   import { decode } from "@msgpack/msgpack";
   import { CartStore, type Cart } from './CartStore';
+  import { get } from "svelte/store";
 
   const { getStore }: any = getContext("store");
   let store: TalkingStickiesStore = getStore();
-  let cartStore = new CartStore(store.synStore, store.myAgentPubKeyB64);
+  let cartStore = store.cartStore;
 
   Marked.setOptions({
     renderer: new Renderer(),
@@ -44,6 +45,8 @@
     smartLists: true,
     smartypants: false,
   });
+
+  let cartStoreState = cartStore.subscribe((state) => state);
 
   $: sortOption = null;
 
@@ -97,53 +100,62 @@
   }
 
   const newGroup = (group: uuidv1) => async () => {
- try {
-   let changes = [];
-   const groups = cloneDeep($state.groups);
+  try {
+    const cartInput = {
+      document_hash: board.document.documentHash,
+      cart_name: `Cart ${$state.groups.length}`,
+      created_at: Date.now() * 1000
+    };
 
-   const cartInput: CloneCartInput = {
-     document_hash: board.document.documentHash,
-     cart_name: `Cart ${groups.length}`,
-   };
+    // Get cloned cell and original DNA hash
+    const cloneInfo = await store.service.callZome("clone_cart_dna", cartInput);
+    console.log("Got clone info (raw):", cloneInfo);
+    console.log("Cell ID structure:", {
+      cell_id: cloneInfo.cell_id,
+      type: typeof cloneInfo.cell_id,
+      isArray: Array.isArray(cloneInfo.cell_id),
+      keys: Object.keys(cloneInfo.cell_id),
+    });
 
-   console.log("Creating cart with input:", {
-     document_hash: encodeHashToBase64(cartInput.document_hash),
-     cart_name: cartInput.cart_name
-   });
+    // Create cart entry in cloned cell
+    console.log("Creating cart entry with cell_id:", cloneInfo.cell_id);
+    const cartRecord = await store.service.callZome(
+  "create_cart_entry", 
+  {
+    input: cartInput,
+    created_at: cloneInfo.created_at // Use timestamp from clone operation
+  }, 
+  cloneInfo.cell_id
+);
 
-   const cartRecord = await store.service.callZome("create_cart", cartInput);
-   console.log("Cart record received:", cartRecord);
+    if (cartRecord?.entry?.Present?.entry) {
+      const cartData = decode(cartRecord.entry.Present.entry) as Cart;
+      
+      // Update CartStore's cells with properly structured cell_id
+      cartStore.state.update(state => ({
+        ...state,
+        cartCells: {
+          ...state.cartCells,
+          [`cart_${encodeHashToBase64(cartData.cart_dna_hash)}`]: {
+            cell_id: cloneInfo.cell_id,
+            network_seed: "" // We'll add this back if needed
+          }
+        }
+      }));
 
-   if (cartRecord?.entry?.Present?.entry) {
-     try {
-       const cartData = decode(cartRecord.entry.Present.entry) as unknown as Cart;
-       console.log("Decoded cart data:", {
-         original_dna_hash: encodeHashToBase64(cartData.original_dna_hash),
-         cart_dna_hash: encodeHashToBase64(cartData.cart_dna_hash),
-         document_hash: encodeHashToBase64(cartData.document_hash),
-         owner: encodeHashToBase64(cartData.owner)
-       });
-
-       const newGroup = new Group(`Cart ${groups.length}`);
-       newGroup.id = `cart_${encodeHashToBase64(cartData.cart_dna_hash)}`;
-       console.log("Creating new group:", {
-         group_id: newGroup.id,
-         cart_dna_hash: encodeHashToBase64(cartData.cart_dna_hash)
-       });
-       
-       groups.push(newGroup);
-       changes.push({ type: "set-groups", groups });
-       await board.requestChanges(changes);
-       
-     } catch (decodeError) {
-       console.error("Error decoding cart data:", decodeError);
-       throw decodeError;
-     }
-   }
- } catch (e) {
-   console.error("Error creating cart:", e);
-   console.error("Error stack:", e.stack);
- }
+      await cartStore.loadCarts();
+      console.log("Cart created - CartStore updated");
+    }
+  } catch (e) {
+    console.error("Error creating cart:", e);
+    console.error("Error stack:", e.stack);
+    console.error("Error creating cart - full details:", {
+      error: e,
+      message: e.message,
+      name: e.name,
+      stack: e.stack,
+    });
+  }
 };
 
   const newSticky = (group: uuidv1) => () => {
@@ -354,37 +366,20 @@
   function handleDragDropGroup(e: DragEvent) {
     e.preventDefault();
     if (draggingHandled) {
-      return;
+        return;
     }
     const target = findDropGroupParentElement(e.target as HTMLElement);
     var srcId = e.dataTransfer.getData("text");
     if (target.id) {
-      if (target.id.startsWith("cart_")) {
-        // This is a cart group
-        const cartDnaHash = target.id.substring(5);
-        store.synStore.client.callZome({
-          role_name: "syn",
-          zome_name: "cart",
-          fn_name: "transfer_sticky_to_cart",
-          payload: {
-            sticky_hash: srcId,
-            cart_dna_hash: cartDnaHash,
-            cart_group_id: target.id,
-          },
-        });
-      } else {
-        board.requestChanges([
-          {
+        board.requestChanges([{
             type: "update-sticky-group",
             id: srcId,
             group: target.id,
             index: 0,
-          },
-        ]);
-      }
+        }]);
     }
     clearDrag();
-  }
+}
   function handleDragDropCard(e: DragEvent) {
     e.preventDefault();
     const target = findDropCardParentElement(e.target as HTMLElement);
@@ -404,22 +399,27 @@
   };
   let dragDuration = 300;
 
+  $: {
+  if ($state && $cartStore) {
+    const allGroups = [...$state.groups, ...($cartStore?.visibleCarts || [])];
+    console.log("Group IDs:", allGroups.map(g => g.id));
+  }
+}
+
   $: items = $state
-    ? $state.groups
-        .map((group) => {
-          return {
-            id: group.id,
-            stickyIds: $state.grouping[group.id],
-          };
-        })
-        .filter((g) => {
-          return (
-            (g.id === UngroupedId &&
-              (g.stickyIds.length > 0 || $state.groups.length === 1)) ||
-            g.id !== UngroupedId
-          );
-        })
-    : undefined;
+  ? [...$state.groups, ...($cartStore?.visibleCarts || [])]
+      .map((group) => ({
+        id: group.id,
+        stickyIds: $state.grouping[group.id] || [],
+      }))
+      .filter((g) => {
+        return (
+          (g.id === UngroupedId &&
+            (g.stickyIds.length > 0 || $state.groups.length === 1)) ||
+          g.id !== UngroupedId
+        );
+      })
+  : undefined;
 
   let [minColWidth, maxColWidth, gap] = [300, 1200, 30];
   let width, height;
